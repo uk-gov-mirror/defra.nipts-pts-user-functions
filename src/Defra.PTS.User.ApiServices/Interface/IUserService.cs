@@ -21,6 +21,8 @@ namespace Defra.PTS.User.ApiServices.Interface
         Task<Entity.User?> GetUserByContactId(Guid contactId);
         Task<bool> DoesUserExistsByContactId(Guid contactId);
         Task UpdateUserEmail(string oldEmail, string newEmail);
+        Task<List<Entity.User>> GetUsersByEmail(string userEmail);
+        Task RetireUserEmail(Guid userId, string newEmail);
         Task<Model.OwnerEmailUpdateModel> GetOwnerEmailUpdateModel(Stream inputStream);
     }
 }   

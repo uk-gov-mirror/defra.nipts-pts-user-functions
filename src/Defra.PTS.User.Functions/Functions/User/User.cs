@@ -81,6 +81,8 @@ var response = req.CreateResponse(HttpStatusCode.OK);
 
             try
        {
+              // Free the new email if a different identity currently holds it, so this account can adopt it without colliding.
+              await RetireConflictingEmailHolders(newEmail!, userModel);
               await userService.UpdateUserEmail(existingUserEmail!, newEmail!);
            await ownerService.UpdateOwnerEmailsByOldEmail(existingUserEmail!, newEmail!);
       logger.LogInformation("Successfully updated user and owner emails for ContactId {ContactId}", userModel.ContactId);
@@ -123,19 +125,97 @@ catch (Exception ex)
             throw new UserFunctionException("User model must have either ContactId or Email");
             }
 
-            bool userExists = await userService.DoesUserExists(userModel.Email);
+            var emailHolders = await userService.GetUsersByEmail(userModel.Email) ?? [];
 
-          if (!userExists)
+            // Same GG identity already owns this email -> ordinary repeat sign-in.
+            var sameIdentityUser = emailHolders.Find(holder => IsSameIdentity(holder, userModel));
+            if (sameIdentityUser != null)
             {
-      logger.LogInformation("Creating new user for email {Email}", userModel.Email);
-Guid userId = await userService.CreateUser(userModel);
-      return userId;
-    }
+                await UpdateSignInTime(userModel.Email);
+                return sameIdentityUser.Id;
+            }
 
-        await UpdateSignInTime(userModel.Email);
-            var existingUserId = await userService.GetUserIdAsync(userModel.Email);
-            return existingUserId;
+            // Email is held only by a different identity (abandoned/re-registered account).
+            // Retire the old holder's email to a reserved .invalid value and register a fresh NIPTS user,
+            // so a new GG ID can never inherit the previous user's data.
+            if (emailHolders.Count > 0)
+            {
+                await RetireConflictingEmailHolders(userModel.Email, userModel);
+                logger.LogInformation("Creating new user for re-registered email {Email}", userModel.Email);
+                return await userService.CreateUser(userModel);
+            }
+
+            logger.LogInformation("Creating new user for email {Email}", userModel.Email);
+            return await userService.CreateUser(userModel);
         }
+
+        /// <summary>
+        /// Renames the email of every existing user whose identity differs from the incoming identity, moving it
+        /// (and any owner records on that email) to a reserved ".invalid" value. Only the email changes, so an
+        /// IDM->PETS sync keyed on ContactId/Uniquereference will not undo the change.
+        /// </summary>
+        private async Task RetireConflictingEmailHolders(string email, Model.User userModel)
+        {
+            var holders = await userService.GetUsersByEmail(email) ?? [];
+
+            foreach (var holder in holders)
+            {
+                if (IsSameIdentity(holder, userModel))
+                {
+                    continue;
+                }
+
+                var retiredEmail = BuildRetiredEmail(email, holder);
+
+                logger.LogWarning(
+                    "Retiring email {Email} held by user {UserId} (Uniquereference {UniqueReference}, ContactId {ContactId}) to {RetiredEmail} due to re-registration by a different identity",
+                    email, holder.Id, holder.Uniquereference, holder.ContactId, retiredEmail);
+
+                await userService.RetireUserEmail(holder.Id, retiredEmail);
+                await ownerService.UpdateOwnerEmailsByOldEmail(email, retiredEmail);
+            }
+        }
+
+        /// <summary>
+        /// Determines whether an existing user record represents the same person as the incoming request.
+        /// A differing Uniquereference (GG ID) is the ONLY reliable evidence of a different person and is the
+        /// sole trigger for a split. A differing ContactId is not: IDM legitimately re-issues ContactIds for the
+        /// same person, so when Uniquereference cannot be compared the records are treated as the same person.
+        /// </summary>
+        private static bool IsSameIdentity(Entity.User existingUser, Model.User incoming)
+        {
+            if (!string.IsNullOrWhiteSpace(incoming.Uniquereference) &&
+                !string.IsNullOrWhiteSpace(existingUser.Uniquereference))
+            {
+                return string.Equals(existingUser.Uniquereference, incoming.Uniquereference, StringComparison.OrdinalIgnoreCase);
+            }
+
+            // No comparable Uniquereference -> cannot prove a different person -> treat as the same account
+            // (covers the ContactId-changed case and legacy rows created before Uniquereference was captured).
+            return true;
+        }
+
+        private static string BuildRetiredEmail(string email, Entity.User holder)
+        {
+            var identityToken = !string.IsNullOrWhiteSpace(holder.Uniquereference)
+                ? new string(holder.Uniquereference!.Where(char.IsLetterOrDigit).ToArray())
+                : holder.Id.ToString("N");
+
+            if (string.IsNullOrEmpty(identityToken))
+            {
+                identityToken = holder.Id.ToString("N");
+            }
+
+            // Append the ContactId held at retirement time so repeated re-registrations of the same
+            // email produce distinct .invalid values and never collide.
+            var contactToken = holder.ContactId.HasValue && holder.ContactId.Value != Guid.Empty
+                ? holder.ContactId.Value.ToString("N")
+                : holder.Id.ToString("N");
+
+            // ".invalid" is a reserved TLD (RFC 2606) so this value can never match a real incoming email.
+            return $"{email}.{identityToken}.{contactToken}.invalid";
+        }
+
 
      /// <summary>
       /// Update User

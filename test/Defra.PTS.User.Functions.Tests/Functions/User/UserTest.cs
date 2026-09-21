@@ -188,13 +188,14 @@ var requestMock = HttpRequestDataHelper.CreateMockHttpRequestData(memoryStream);
         }
 
         [Test]
-        public async Task CreateUser_ContactIdNotFound_UserExists_ReturnsExistingUserId()
+        public async Task CreateUser_ContactIdNotFound_SameIdentityEmailHolder_ReturnsExistingUserId()
    {
          var contactId = Guid.NewGuid();
  var existingUserId = Guid.NewGuid();
      var email = "existing@example.com";
 
-        var userModel = new Model.User { ContactId = contactId, Email = email };
+        var userModel = new Model.User { ContactId = contactId, Uniquereference = "REF1", Email = email };
+        var existingUser = new Entity.User { Id = existingUserId, Uniquereference = "REF1", Email = email };
 
  var json = JsonConvert.SerializeObject(userModel);
    var memoryStream = new MemoryStream(Encoding.UTF8.GetBytes(json));
@@ -202,9 +203,8 @@ var requestMock = HttpRequestDataHelper.CreateMockHttpRequestData(memoryStream);
 
             userServiceMock.Setup(a => a.GetUserModel(It.IsAny<Stream>())).ReturnsAsync(userModel);
 userServiceMock.Setup(a => a.GetUserByContactId(contactId)).ReturnsAsync((Entity.User?)null);
- userServiceMock.Setup(a => a.DoesUserExists(email)).ReturnsAsync(true);
+ userServiceMock.Setup(a => a.GetUsersByEmail(email)).ReturnsAsync([existingUser]);
        userServiceMock.Setup(a => a.UpdateUser(email, "signin")).ReturnsAsync(existingUserId);
-    userServiceMock.Setup(a => a.GetUserIdAsync(email)).ReturnsAsync(existingUserId);
 
    var result = await sut!.CreateUser(requestMock);
 
@@ -212,8 +212,134 @@ userServiceMock.Setup(a => a.GetUserByContactId(contactId)).ReturnsAsync((Entity
   Assert.That(result.StatusCode, Is.EqualTo(HttpStatusCode.OK));
 
             userServiceMock.Verify(a => a.UpdateUser(email, "signin"), Times.Once);
-      userServiceMock.Verify(a => a.GetUserIdAsync(email), Times.Once);
+      userServiceMock.Verify(a => a.CreateUser(It.IsAny<Model.User>()), Times.Never);
+      userServiceMock.Verify(a => a.RetireUserEmail(It.IsAny<Guid>(), It.IsAny<string>()), Times.Never);
         }
+
+        [Test]
+        public async Task CreateUser_ReRegistrationWithNewUniqueReference_RetiresOldAndCreatesNew()
+        {
+            var newContactId = Guid.NewGuid();
+            var oldContactId = Guid.NewGuid();
+            var oldUserId = Guid.NewGuid();
+            var newUserId = Guid.NewGuid();
+            var email = "contact@help.com";
+
+            var userModel = new Model.User { ContactId = newContactId, Uniquereference = "REF-NEW", Email = email };
+            var oldUser = new Entity.User { Id = oldUserId, Uniquereference = "REF-OLD", ContactId = oldContactId, Email = email };
+
+            var json = JsonConvert.SerializeObject(userModel);
+            var memoryStream = new MemoryStream(Encoding.UTF8.GetBytes(json));
+            var requestMock = HttpRequestDataHelper.CreateMockHttpRequestData(memoryStream);
+
+            userServiceMock.Setup(a => a.GetUserModel(It.IsAny<Stream>())).ReturnsAsync(userModel);
+            userServiceMock.Setup(a => a.GetUserByContactId(newContactId)).ReturnsAsync((Entity.User?)null);
+            userServiceMock.Setup(a => a.GetUsersByEmail(email)).ReturnsAsync([oldUser]);
+            userServiceMock.Setup(a => a.RetireUserEmail(It.IsAny<Guid>(), It.IsAny<string>())).Returns(Task.CompletedTask);
+            ownerServiceMock.Setup(a => a.UpdateOwnerEmailsByOldEmail(It.IsAny<string>(), It.IsAny<string>())).Returns(Task.CompletedTask);
+            userServiceMock.Setup(a => a.CreateUser(userModel)).ReturnsAsync(newUserId);
+
+            var result = await sut!.CreateUser(requestMock);
+
+            Assert.That(result, Is.Not.Null);
+            Assert.That(result.StatusCode, Is.EqualTo(HttpStatusCode.OK));
+
+            var expectedRetiredEmail = $"{email}.REFOLD.{oldContactId:N}.invalid";
+            userServiceMock.Verify(a => a.RetireUserEmail(oldUserId, expectedRetiredEmail), Times.Once);
+            ownerServiceMock.Verify(a => a.UpdateOwnerEmailsByOldEmail(email, expectedRetiredEmail), Times.Once);
+            userServiceMock.Verify(a => a.CreateUser(userModel), Times.Once);
+            userServiceMock.Verify(a => a.UpdateUser(It.IsAny<string>(), "signin"), Times.Never);
+        }
+
+        [Test]
+        public async Task CreateUser_ContactIdChanged_SameUniqueReference_ReusesExistingUserWithoutSplitting()
+        {
+            var newContactId = Guid.NewGuid();
+            var oldContactId = Guid.NewGuid();
+            var existingUserId = Guid.NewGuid();
+            var email = "person@example.com";
+
+            var userModel = new Model.User { ContactId = newContactId, Uniquereference = "REF1", Email = email };
+            var existingUser = new Entity.User { Id = existingUserId, ContactId = oldContactId, Uniquereference = "REF1", Email = email };
+
+            var json = JsonConvert.SerializeObject(userModel);
+            var memoryStream = new MemoryStream(Encoding.UTF8.GetBytes(json));
+            var requestMock = HttpRequestDataHelper.CreateMockHttpRequestData(memoryStream);
+
+            userServiceMock.Setup(a => a.GetUserModel(It.IsAny<Stream>())).ReturnsAsync(userModel);
+            // IDM re-issued the ContactId, so the row is not found by ContactId.
+            userServiceMock.Setup(a => a.GetUserByContactId(newContactId)).ReturnsAsync((Entity.User?)null);
+            userServiceMock.Setup(a => a.GetUsersByEmail(email)).ReturnsAsync([existingUser]);
+            userServiceMock.Setup(a => a.UpdateUser(email, "signin")).ReturnsAsync(existingUserId);
+
+            var result = await sut!.CreateUser(requestMock);
+
+            Assert.That(result, Is.Not.Null);
+            Assert.That(result.StatusCode, Is.EqualTo(HttpStatusCode.OK));
+
+            userServiceMock.Verify(a => a.UpdateUser(email, "signin"), Times.Once);
+            userServiceMock.Verify(a => a.RetireUserEmail(It.IsAny<Guid>(), It.IsAny<string>()), Times.Never);
+            userServiceMock.Verify(a => a.CreateUser(It.IsAny<Model.User>()), Times.Never);
+        }
+
+        [Test]
+        public async Task CreateUser_ContactIdChanged_NoUniqueReference_ReusesExistingUserWithoutSplitting()
+        {
+            var newContactId = Guid.NewGuid();
+            var oldContactId = Guid.NewGuid();
+            var existingUserId = Guid.NewGuid();
+            var email = "person@example.com";
+
+            // Neither side carries a Uniquereference, only the ContactId differs -> must NOT be treated as a new identity.
+            var userModel = new Model.User { ContactId = newContactId, Email = email };
+            var existingUser = new Entity.User { Id = existingUserId, ContactId = oldContactId, Email = email };
+
+            var json = JsonConvert.SerializeObject(userModel);
+            var memoryStream = new MemoryStream(Encoding.UTF8.GetBytes(json));
+            var requestMock = HttpRequestDataHelper.CreateMockHttpRequestData(memoryStream);
+
+            userServiceMock.Setup(a => a.GetUserModel(It.IsAny<Stream>())).ReturnsAsync(userModel);
+            userServiceMock.Setup(a => a.GetUserByContactId(newContactId)).ReturnsAsync((Entity.User?)null);
+            userServiceMock.Setup(a => a.GetUsersByEmail(email)).ReturnsAsync([existingUser]);
+            userServiceMock.Setup(a => a.UpdateUser(email, "signin")).ReturnsAsync(existingUserId);
+
+            var result = await sut!.CreateUser(requestMock);
+
+            Assert.That(result, Is.Not.Null);
+            Assert.That(result.StatusCode, Is.EqualTo(HttpStatusCode.OK));
+
+            userServiceMock.Verify(a => a.RetireUserEmail(It.IsAny<Guid>(), It.IsAny<string>()), Times.Never);
+            userServiceMock.Verify(a => a.CreateUser(It.IsAny<Model.User>()), Times.Never);
+        }
+
+        [Test]
+        public async Task CreateUser_EmailExistsWithNoComparableIdentity_ReusesExistingUser()
+        {
+            var existingUserId = Guid.NewGuid();
+            var email = "legacy@example.com";
+
+            // Caller supplies neither ContactId nor Uniquereference -> legacy email-only behaviour.
+            var userModel = new Model.User { Email = email };
+            var existingUser = new Entity.User { Id = existingUserId, Email = email };
+
+            var json = JsonConvert.SerializeObject(userModel);
+            var memoryStream = new MemoryStream(Encoding.UTF8.GetBytes(json));
+            var requestMock = HttpRequestDataHelper.CreateMockHttpRequestData(memoryStream);
+
+            userServiceMock.Setup(a => a.GetUserModel(It.IsAny<Stream>())).ReturnsAsync(userModel);
+            userServiceMock.Setup(a => a.GetUsersByEmail(email)).ReturnsAsync([existingUser]);
+            userServiceMock.Setup(a => a.UpdateUser(email, "signin")).ReturnsAsync(existingUserId);
+
+            var result = await sut!.CreateUser(requestMock);
+
+            Assert.That(result, Is.Not.Null);
+            Assert.That(result.StatusCode, Is.EqualTo(HttpStatusCode.OK));
+
+            userServiceMock.Verify(a => a.UpdateUser(email, "signin"), Times.Once);
+            userServiceMock.Verify(a => a.CreateUser(It.IsAny<Model.User>()), Times.Never);
+            userServiceMock.Verify(a => a.RetireUserEmail(It.IsAny<Guid>(), It.IsAny<string>()), Times.Never);
+        }
+
 
         [Test]
  public async Task CreateUser_NoContactId_FallsBackToEmailLogic()
@@ -237,7 +363,7 @@ userServiceMock.Setup(a => a.CreateUser(userModel)).ReturnsAsync(newUserId);
      Assert.That(result.StatusCode, Is.EqualTo(HttpStatusCode.OK));
 
 userServiceMock.Verify(a => a.GetUserByContactId(It.IsAny<Guid>()), Times.Never);
-        userServiceMock.Verify(a => a.DoesUserExists(email), Times.Once);
+        userServiceMock.Verify(a => a.GetUsersByEmail(email), Times.Once);
         }
 
     [Test]

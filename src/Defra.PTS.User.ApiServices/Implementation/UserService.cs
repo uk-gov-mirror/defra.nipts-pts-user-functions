@@ -153,6 +153,29 @@ namespace Defra.PTS.User.ApiServices.Implementation
             }
         }
 
+        public async Task<List<Entity.User>> GetUsersByEmail(string userEmail)
+        {
+            if (string.IsNullOrEmpty(userEmail))
+                return [];
+
+            return await _userRepository.GetUsersByEmailAsync(userEmail);
+        }
+
+        public async Task RetireUserEmail(Guid userId, string newEmail)
+        {
+            if (userId == Guid.Empty || string.IsNullOrEmpty(newEmail))
+                return;
+
+            var user = _userRepository.Find(userId);
+            if (user == null)
+                return;
+
+            user.Email = newEmail;
+            user.UpdatedOn = DateTime.UtcNow;
+            _userRepository.Update(user);
+            await _userRepository.SaveChanges();
+        }
+
         public async Task<Model.OwnerEmailUpdateModel> GetOwnerEmailUpdateModel(Stream inputStream)
         {
             try

@@ -31,7 +31,22 @@ namespace Defra.PTS.User.Repositories.Implementation
 
         public async Task<Entity.User?> GetUser(string userEmailAddress)
         {
-                return await UserContext?.User?.SingleOrDefaultAsync(a => a.Email == userEmailAddress)!;
+            // Ordered + FirstOrDefault (not SingleOrDefault) so historical duplicate-email rows do not throw on sign-in.
+            return await UserContext?.User?
+                .Where(a => a.Email == userEmailAddress)
+                .OrderByDescending(a => a.CreatedOn)
+                .FirstOrDefaultAsync()!;
+        }
+
+        public async Task<List<Entity.User>> GetUsersByEmailAsync(string userEmailAddress)
+        {
+            if (UserContext?.User == null)
+                return [];
+
+            return await UserContext.User
+                .Where(a => a.Email == userEmailAddress)
+                .OrderByDescending(a => a.CreatedOn)
+                .ToListAsync();
         }
 
         [ExcludeFromCodeCoverage]
